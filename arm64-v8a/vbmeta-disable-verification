@@ -1,14 +1,14 @@
-#!/system/bin/sh
-# Patch an AVB vbmeta image to set disable-verity and disable-verification.
-# Compatible with Android/TWRP /system/bin/sh and ordinary POSIX sh.
-# Usage: sh vbmeta-disable-verification.sh input-vbmeta.img [output-vbmeta.img]
-# The input is never modified; output must not already exist.
+#!/bin/sh
+# Portable POSIX-shell replacement for the Android ARM64 executable.
+# It does not execute ./arm64-v8a/vbmeta-disable-verification.
+# Usage: ./vbmeta-disable-verification.sh <input-vbmeta.img> [output-vbmeta.img]
+# By default, writes <input-vbmeta.img>.disabled and leaves the input untouched.
 
 set -eu
 
 usage() {
-    echo "Usage: sh $0 <input-vbmeta.img> [output-vbmeta.img]" >&2
-    echo "Creates a patched copy; the original image is left unchanged." >&2
+    echo "Usage: $0 <input-vbmeta.img> [output-vbmeta.img]" >&2
+    echo "Creates a patched copy; the original image is not modified." >&2
 }
 
 fail() {
@@ -24,12 +24,20 @@ fi
 input=$1
 output=${2:-"${input}.disabled"}
 
+# Keep paths beginning with '-' from being parsed as command options.
+case "$input" in -*) input=./$input ;; esac
+case "$output" in -*) output=./$output ;; esac
+
 [ -f "$input" ] || fail "Input file not found: $input"
 [ -r "$input" ] || fail "Input file is not readable: $input"
 [ "$input" != "$output" ] || fail "Input and output paths must be different."
 [ ! -e "$output" ] || fail "Output already exists: $output (choose a new output path)."
 
-# AVB vbmeta header: magic "AVB0" at offset 0; flags byte is at offset 123.
+tmp="${output}.tmp.$$"
+[ ! -e "$tmp" ] || fail "Temporary file already exists: $tmp"
+cleanup() { rm -f "$tmp"; }
+trap cleanup 0 HUP INT TERM
+
 size=$(wc -c < "$input" | tr -d '[:space:]')
 case "$size" in
     ''|*[!0-9]*) fail "Could not determine input file size." ;;
@@ -39,25 +47,26 @@ esac
 magic=$(od -An -tc -N 4 "$input" | tr -d '[:space:]')
 [ "$magic" = "AVB0" ] || fail "Input does not start with the AVB0 vbmeta magic."
 
+# AVB stores flags as a big-endian 32-bit field at byte offset 120;
+# the low two bits are the last byte (offset 123).
 current=$(od -An -tu1 -j 123 -N 1 "$input" | tr -d '[:space:]')
 case "$current" in
     ''|*[!0-9]*) fail "Could not read the vbmeta flags byte." ;;
 esac
-
-# Bit 0 disables dm-verity; bit 1 disables AVB verification.
 new=$((current | 3))
 
-cp "$input" "$output" || fail "Could not copy input to output: $output"
-if ! printf "\\$(printf '%03o' "$new")" | dd of="$output" bs=1 seek=123 conv=notrunc 2>/dev/null; then
-    rm -f "$output"
-    fail "Failed to write patched flags; incomplete output removed."
+cp -p "$input" "$tmp" || fail "Could not create temporary output: $tmp"
+byte=$(printf '%03o' "$new")
+if ! printf "\\$byte" | dd of="$tmp" bs=1 seek=123 conv=notrunc 2>/dev/null; then
+    fail "Failed to write patched flags."
 fi
 
-verified=$(od -An -tu1 -j 123 -N 1 "$output" | tr -d '[:space:]')
-if [ "$verified" != "$new" ]; then
-    rm -f "$output"
-    fail "Verification of the patched output failed; output removed."
-fi
+verified=$(od -An -tu1 -j 123 -N 1 "$tmp" | tr -d '[:space:]')
+[ "$verified" = "$new" ] || fail "Verification of the patched output failed."
+
+mv "$tmp" "$output" || fail "Could not move patched image into place: $output"
+# The temp path no longer exists, so the cleanup trap is harmless.
+trap - 0 HUP INT TERM
 
 echo "Successfully patched vbmeta image."
 echo "Input:  $input"
